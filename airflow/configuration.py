@@ -8,6 +8,7 @@ import errno
 import logging
 import os
 import subprocess
+import warnings
 
 from future import standard_library
 standard_library.install_aliases()
@@ -16,6 +17,11 @@ from builtins import str
 from collections import OrderedDict
 from configparser import ConfigParser
 
+# show Airflow's deprecation warnings
+warnings.filterwarnings(
+    action='default', category=DeprecationWarning, module='airflow')
+warnings.filterwarnings(
+    action='default', category=PendingDeprecationWarning, module='airflow')
 
 class AirflowConfigException(Exception):
     pass
@@ -114,7 +120,7 @@ defaults = {
         'flower_port': '5555'
     },
     'email': {
-        'email_backend': 'airflow.utils.send_email_smtp',
+        'email_backend': 'airflow.utils.email.send_email_smtp',
     },
     'smtp': {
         'smtp_starttls': True,
@@ -242,11 +248,11 @@ authenticate = False
 filter_by_owner = False
 
 [email]
-email_backend = airflow.utils.send_email_smtp
+email_backend = airflow.utils.email.send_email_smtp
 
 [smtp]
 # If you want airflow to send emails on retries, failure, and you want to
-# the airflow.utils.send_email function, you have to configure an smtp
+# the airflow.utils.email.send_email_smtp function, you have to configure an smtp
 # server here
 smtp_host = localhost
 smtp_starttls = True
@@ -350,7 +356,7 @@ authenticate = False
 TEST_CONFIG = """\
 [core]
 airflow_home = {AIRFLOW_HOME}
-dags_folder = {AIRFLOW_HOME}/dags
+dags_folder = {TEST_DAGS_FOLDER}
 base_log_folder = {AIRFLOW_HOME}/logs
 executor = SequentialExecutor
 sql_alchemy_conn = sqlite:///{AIRFLOW_HOME}/unittests.db
@@ -367,7 +373,7 @@ web_server_host = 0.0.0.0
 web_server_port = 8080
 
 [email]
-email_backend = airflow.utils.send_email_smtp
+email_backend = airflow.utils.email.send_email_smtp
 
 [smtp]
 smtp_host = localhost
@@ -576,6 +582,17 @@ if 'AIRFLOW_CONFIG' not in os.environ:
         AIRFLOW_CONFIG = AIRFLOW_HOME + '/airflow.cfg'
 else:
     AIRFLOW_CONFIG = expand_env_var(os.environ['AIRFLOW_CONFIG'])
+
+# Set up dags folder for unit tests
+# this directory won't exist if users install via pip
+_TEST_DAGS_FOLDER = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+    'tests',
+    'dags')
+if os.path.exists(_TEST_DAGS_FOLDER):
+    TEST_DAGS_FOLDER = _TEST_DAGS_FOLDER
+else:
+    TEST_DAGS_FOLDER = os.path.join(AIRFLOW_HOME, 'dags')
 
 
 def parameterized_config(template):

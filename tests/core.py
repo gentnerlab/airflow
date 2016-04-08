@@ -12,6 +12,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 import signal
 from time import sleep
+import warnings
 
 from dateutil.relativedelta import relativedelta
 
@@ -34,7 +35,7 @@ from airflow.configuration import AirflowConfigException
 
 import six
 
-NUM_EXAMPLE_DAGS = 14
+NUM_EXAMPLE_DAGS = 15
 DEV_NULL = '/dev/null'
 TEST_DAG_FOLDER = os.path.join(
     os.path.dirname(os.path.realpath(__file__)), 'dags')
@@ -42,7 +43,7 @@ DEFAULT_DATE = datetime(2015, 1, 1)
 DEFAULT_DATE_ISO = DEFAULT_DATE.isoformat()
 DEFAULT_DATE_DS = DEFAULT_DATE_ISO[:10]
 TEST_DAG_ID = 'unit_tests'
-configuration.test_mode()
+
 
 try:
     import cPickle as pickle
@@ -319,6 +320,22 @@ class CoreTest(unittest.TestCase):
             upstream=True, downstream=True)
         ti = models.TaskInstance(task=task, execution_date=DEFAULT_DATE)
         ti.are_dependents_done()
+
+    def test_illegal_args(self):
+        """
+        Tests that Operators reject illegal arguments
+        """
+        with warnings.catch_warnings(record=True) as w:
+            t = operators.BashOperator(
+                task_id='test_illegal_args',
+                bash_command='echo success',
+                dag=self.dag,
+                illegal_argument_1234='hello?')
+            self.assertTrue(
+                issubclass(w[0].category, PendingDeprecationWarning))
+            self.assertIn(
+                'Invalid arguments were passed to BashOperator.',
+                w[0].message.args[0])
 
     def test_bash_operator(self):
         t = operators.BashOperator(

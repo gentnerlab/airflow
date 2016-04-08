@@ -17,17 +17,14 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-from builtins import str
 from past.builtins import basestring
 from collections import defaultdict, Counter
 from datetime import datetime
 from itertools import product
 import getpass
 import logging
-import signal
 import socket
 import subprocess
-import sys
 from time import sleep
 
 from sqlalchemy import Column, Integer, String, DateTime, func, Index, or_
@@ -40,7 +37,6 @@ from airflow.utils.state import State
 from airflow.utils.db import provide_session, pessimistic_connection_handling
 from airflow.utils.email import send_email
 from airflow.utils.logging import LoggingMixin
-from airflow.utils import asciiart
 
 
 Base = models.Base
@@ -415,8 +411,6 @@ class SchedulerJob(BaseJob):
                     # Migrating from previous version
                     # make the past 5 runs active
                     next_run_date = dag.date_range(latest_run, -5)[0]
-                    if dag.start_date:
-                        next_run_date = max(next_run_date, dag.start_date)
                 else:
                     task_start_dates = [t.start_date for t in dag.tasks]
                     if task_start_dates:
@@ -425,6 +419,10 @@ class SchedulerJob(BaseJob):
                         next_run_date = None
             elif dag.schedule_interval != '@once':
                 next_run_date = dag.following_schedule(last_scheduled_run)
+
+            # don't ever schedule prior to the dag's start_date
+            if dag.start_date:
+                next_run_date = max(next_run_date, dag.start_date)
 
             # this structure is necessary to avoid a TypeError from concatenating
             # NoneType
@@ -499,6 +497,7 @@ class SchedulerJob(BaseJob):
             skip_tis = {(ti[0], ti[1]) for ti in qry.all()}
 
         descartes = [obj for obj in product(dag.tasks, active_runs)]
+        could_not_run = set()
         self.logger.info('Checking dependencies on {} tasks instances, minus {} '
                      'skippable ones'.format(len(descartes), len(skip_tis)))
         for task, dttm in descartes:
@@ -513,6 +512,23 @@ class SchedulerJob(BaseJob):
             elif ti.is_runnable(flag_upstream_failed=True):
                 self.logger.debug('Firing task: {}'.format(ti))
                 executor.queue_task_instance(ti, pickle_id=pickle_id)
+            else:
+                could_not_run.add(ti)
+
+        # this type of deadlock happens when dagruns can't even start and so
+        # the TI's haven't been persisted to the database.
+        if len(could_not_run) == len(descartes):
+            self.logger.error(
+                'Dag runs are deadlocked for DAG: {}'.format(dag.dag_id))
+            (session
+                .query(models.DagRun)
+                .filter(
+                    models.DagRun.dag_id == dag.dag_id,
+                    models.DagRun.state == State.RUNNING,
+                    models.DagRun.execution_date.in_(active_runs))
+                .update(
+                    {models.DagRun.state: State.FAILED},
+                    synchronize_session='fetch'))
 
         # Releasing the lock
         self.logger.debug("Unlocking DAG (scheduler_lock)")
@@ -553,8 +569,6 @@ class SchedulerJob(BaseJob):
                 # collect queued tasks for prioritiztion
                 if ti.state == State.QUEUED:
                     self.queued_tis.add(ti)
-                elif ti in self.queued_tis:
-                    self.queued_tis.remove(ti)
             else:
                 # special instructions for failed executions could go here
                 pass
@@ -582,6 +596,8 @@ class SchedulerJob(BaseJob):
                 session.commit()
             else:
                 d[ti.pool].append(ti)
+
+        self.queued_tis.clear()
 
         dag_blacklist = set(dagbag.paused_dags())
         for pool, tis in list(d.items()):
@@ -643,18 +659,13 @@ class SchedulerJob(BaseJob):
     def _execute(self):
         dag_id = self.dag_id
 
-        def signal_handler(signum, frame):
-            self.logger.error("SIGINT (ctrl-c) received")
-            sys.exit(1)
-        signal.signal(signal.SIGINT, signal_handler)
-
         pessimistic_connection_handling()
 
         logging.basicConfig(level=logging.DEBUG)
         self.logger.info("Starting the scheduler")
 
         dagbag = models.DagBag(self.subdir, sync_to_db=True)
-        executor = dagbag.executor
+        executor = self.executor = dagbag.executor
         executor.start()
         i = 0
         while not self.num_runs or self.num_runs > i:
@@ -716,6 +727,7 @@ class SchedulerJob(BaseJob):
                     self.logger.error("Tachycardia!")
             except Exception as deep_e:
                 self.logger.exception(deep_e)
+                raise
             finally:
                 settings.Session.remove()
         executor.end()
@@ -780,11 +792,12 @@ class BackfillJob(BaseJob):
 
         # Build a list of all instances to run
         tasks_to_run = {}
-        failed = []
-        succeeded = []
-        started = []
-        wont_run = []
-        not_ready_to_run = set()
+        failed = set()
+        succeeded = set()
+        started = set()
+        skipped = set()
+        not_ready = set()
+        deadlocked = set()
 
         for task in self.dag.tasks:
             if (not self.include_adhoc) and task.adhoc:
@@ -799,9 +812,8 @@ class BackfillJob(BaseJob):
         session.commit()
 
         # Triggering what is ready to get triggered
-        deadlocked = False
         while tasks_to_run and not deadlocked:
-
+            not_ready.clear()
             for key, ti in list(tasks_to_run.items()):
 
                 ti.refresh_from_db()
@@ -809,18 +821,24 @@ class BackfillJob(BaseJob):
                     self.ignore_first_depends_on_past and
                     ti.execution_date == (start_date or ti.start_date))
 
-                # Did the task finish without failing? -- then we're done
-                if (
-                        ti.state in (State.SUCCESS, State.SKIPPED) and
-                        key in tasks_to_run):
-                    succeeded.append(key)
-                    tasks_to_run.pop(key)
+                # The task was already marked successful or skipped by a
+                # different Job. Don't rerun it.
+                if key not in started:
+                    if ti.state == State.SUCCESS:
+                        succeeded.add(key)
+                        tasks_to_run.pop(key)
+                        continue
+                    elif ti.state == State.SKIPPED:
+                        skipped.add(key)
+                        tasks_to_run.pop(key)
+                        continue
 
-                # Is the task runnable? -- the run it
-                elif ti.is_queueable(
+                # Is the task runnable? -- then run it
+                if ti.is_queueable(
                         include_queued=True,
                         ignore_depends_on_past=ignore_depends_on_past,
                         flag_upstream_failed=True):
+                    self.logger.debug('Sending {} to executor'.format(ti))
                     executor.queue_task_instance(
                         ti,
                         mark_success=self.mark_success,
@@ -828,37 +846,21 @@ class BackfillJob(BaseJob):
                         ignore_dependencies=self.ignore_dependencies,
                         ignore_depends_on_past=ignore_depends_on_past,
                         pool=self.pool)
-                    ti.state = State.RUNNING
-                    if key not in started:
-                        started.append(key)
-                    if ti in not_ready_to_run:
-                        not_ready_to_run.remove(ti)
+                    started.add(key)
 
-                # Mark the task as not ready to run. If the set of tasks
-                # that aren't ready ever equals the set of tasks to run,
-                # then the backfill is deadlocked
+                # Mark the task as not ready to run
                 elif ti.state in (State.NONE, State.UPSTREAM_FAILED):
-                    not_ready_to_run.add(ti)
-                    if not_ready_to_run == set(tasks_to_run.values()):
-                        msg = 'BackfillJob is deadlocked: no tasks can be run.'
-                        if any(
-                                t.are_dependencies_met() !=
-                                t.are_dependencies_met(
-                                    ignore_depends_on_past=True)
-                                for t in tasks_to_run.values()):
-                            msg += (
-                                ' Some of the tasks that were unable to '
-                                'run have "depends_on_past=True". Try running '
-                                'the backfill with the option '
-                                '"ignore_first_depends_on_past=True" '
-                                ' or passing "-I" at the command line.')
-                        self.logger.error(msg)
-                        deadlocked = True
-                        wont_run.extend(not_ready_to_run)
-                        tasks_to_run.clear()
+                    self.logger.debug('Added {} to not_ready'.format(ti))
+                    not_ready.add(key)
 
             self.heartbeat()
             executor.heartbeat()
+
+            # If the set of tasks that aren't ready ever equals the set of
+            # tasks to run, then the backfill is deadlocked
+            if not_ready and not_ready == set(tasks_to_run):
+                deadlocked.update(tasks_to_run.values())
+                tasks_to_run.clear()
 
             # Reacting to events
             for key, state in list(executor.get_event_buffer().items()):
@@ -878,18 +880,19 @@ class BackfillJob(BaseJob):
                             'although the task says it is running.'.format(key))
                         self.logger.error(msg)
                         ti.handle_failure(msg)
+                        tasks_to_run.pop(key)
 
                     # task reports skipped
                     elif ti.state == State.SKIPPED:
-                        wont_run.append(key)
                         self.logger.error("Skipping {} ".format(key))
+                        skipped.add(key)
+                        tasks_to_run.pop(key)
 
                     # anything else is a failure
                     else:
-                        failed.append(key)
                         self.logger.error("Task instance {} failed".format(key))
-
-                    tasks_to_run.pop(key)
+                        failed.add(key)
+                        tasks_to_run.pop(key)
 
                 # executor reports success
                 elif state == State.SUCCESS:
@@ -898,18 +901,25 @@ class BackfillJob(BaseJob):
                     if ti.state == State.SUCCESS:
                         self.logger.info(
                             'Task instance {} succeeded'.format(key))
-                        succeeded.append(key)
+                        succeeded.add(key)
                         tasks_to_run.pop(key)
 
                     # task reports failure
                     elif ti.state == State.FAILED:
                         self.logger.error("Task instance {} failed".format(key))
-                        failed.append(key)
+                        failed.add(key)
+                        tasks_to_run.pop(key)
+
+                    # task reports skipped
+                    elif ti.state == State.SKIPPED:
+                        self.logger.info("Task instance {} skipped".format(key))
+                        skipped.add(key)
                         tasks_to_run.pop(key)
 
                     # this probably won't ever be triggered
-                    elif key in not_ready_to_run:
-                        continue
+                    elif ti in not_ready:
+                        self.logger.info(
+                            "{} wasn't expected to run, but it did".format(ti))
 
                     # executor reports success but task does not - this is weird
                     elif ti.state not in (
@@ -938,29 +948,51 @@ class BackfillJob(BaseJob):
                             ti.handle_failure(msg)
                             tasks_to_run.pop(key)
 
-            msg = (
-                "[backfill progress] "
-                "waiting: {0} | "
-                "succeeded: {1} | "
-                "kicked_off: {2} | "
-                "failed: {3} | "
-                "wont_run: {4} ").format(
-                    len(tasks_to_run),
-                    len(succeeded),
-                    len(started),
-                    len(failed),
-                    len(wont_run))
+            msg = ' | '.join([
+                "[backfill progress]",
+                "waiting: {0}",
+                "succeeded: {1}",
+                "kicked_off: {2}",
+                "failed: {3}",
+                "skipped: {4}",
+                "deadlocked: {5}"
+            ]).format(
+                len(tasks_to_run),
+                len(succeeded),
+                len(started),
+                len(failed),
+                len(skipped),
+                len(deadlocked))
             self.logger.info(msg)
 
         executor.end()
         session.close()
+
+        err = ''
         if failed:
-            msg = (
-                "------------------------------------------\n"
-                "Some tasks instances failed, "
-                "here's the list:\n{}".format(failed))
-            raise AirflowException(msg)
-        self.logger.info("All done. Exiting.")
+            err += (
+                "---------------------------------------------------\n"
+                "Some task instances failed:\n{}\n".format(failed))
+        if deadlocked:
+            err += (
+                '---------------------------------------------------\n'
+                'BackfillJob is deadlocked.')
+            deadlocked_depends_on_past = any(
+                t.are_dependencies_met() != t.are_dependencies_met(
+                    ignore_depends_on_past=True)
+                for t in deadlocked)
+            if deadlocked_depends_on_past:
+                err += (
+                    'Some of the deadlocked tasks were unable to run because '
+                    'of "depends_on_past" relationships. Try running the '
+                    'backfill with the option '
+                    '"ignore_first_depends_on_past=True" or passing "-I" at '
+                    'the command line.')
+            err += ' These tasks were unable to run:\n{}\n'.format(deadlocked)
+        if err:
+            raise AirflowException(err)
+
+        self.logger.info("Backfill done. Exiting.")
 
 
 class LocalTaskJob(BaseJob):
